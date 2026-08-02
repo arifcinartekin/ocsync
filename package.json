@@ -9,8 +9,14 @@
 		"typecheck": "tsc -noEmit -skipLibCheck",
 		"test": "node scripts/test-decide-action.mjs"
 	},
-	"keywords": [],
-	"author": "",
+	"keywords": [
+		"obsidian",
+		"obsidian-plugin",
+		"encryption",
+		"sync",
+		"github"
+	],
+	"author": "arifcinartekin",
 	"license": "MIT",
 	"devDependencies": {
 		"@types/node": "^20.14.2",
