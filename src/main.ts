@@ -3,8 +3,18 @@ import { DEFAULT_SETTINGS, OCSyncSettings, OCSyncSettingTab } from "./settings";
 import { PasswordModal } from "./passwordModal";
 import { GitHubClient } from "./github";
 import { base64ToBytes, bytesToBase64, deriveKey, encryptBytes, generateSalt } from "./crypto";
+import { decryptManifest, encryptManifest } from "./manifest";
+import { commitChanges, PendingBlob } from "./gitCommit";
+import { scanVault } from "./vaultScanner";
+import { DEFAULT_LOCAL_STATE, emptyManifest, LocalSyncState, Manifest } from "./types";
 
 const SALT_PATH = "salt.txt";
+const MANIFEST_PATH = "manifest.enc";
+
+interface PersistedData {
+	settings: OCSyncSettings;
+	localState: LocalSyncState;
+}
 
 type SyncStatus = "locked" | "idle" | "syncing" | "ok" | "error";
 
@@ -22,6 +32,7 @@ function contentBase64ToText(contentBase64: string): string {
 
 export default class OCSyncPlugin extends Plugin {
 	settings: OCSyncSettings = DEFAULT_SETTINGS;
+	private localState: LocalSyncState = DEFAULT_LOCAL_STATE;
 
 	/**
 	 * Session-only state. The derived key and salt live in memory for as
@@ -48,8 +59,14 @@ export default class OCSyncPlugin extends Plugin {
 
 		this.addCommand({
 			id: "ocsync-sync-active-file",
-			name: "Sync now (Phase 1: test push active file)",
+			name: "Debug: test push active file only",
 			callback: () => this.manualSyncActiveFile(),
+		});
+
+		this.addCommand({
+			id: "ocsync-push-vault",
+			name: "Sync now (push entire vault)",
+			callback: () => this.pushFullVault(),
 		});
 
 		this.app.workspace.onLayoutReady(() => {
@@ -64,11 +81,22 @@ export default class OCSyncPlugin extends Plugin {
 	}
 
 	async loadSettings(): Promise<void> {
-		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+		const data = ((await this.loadData()) ?? {}) as Partial<PersistedData>;
+		this.settings = Object.assign({}, DEFAULT_SETTINGS, data.settings);
+		this.localState = Object.assign({}, DEFAULT_LOCAL_STATE, data.localState);
 	}
 
 	async saveSettings(): Promise<void> {
-		await this.saveData(this.settings);
+		await this.persistData();
+	}
+
+	private async saveLocalState(): Promise<void> {
+		await this.persistData();
+	}
+
+	private async persistData(): Promise<void> {
+		const data: PersistedData = { settings: this.settings, localState: this.localState };
+		await this.saveData(data);
 	}
 
 	/** Placeholder until Phase 4 introduces the real periodic sync loop. */
@@ -170,6 +198,85 @@ export default class OCSyncPlugin extends Plugin {
 
 			this.setStatus("ok");
 			new Notice(`OCSync: pushed encrypted "${file.path}" to GitHub`);
+		} catch (e) {
+			this.setStatus("error");
+			new Notice(`OCSync: sync failed - ${(e as Error).message}`);
+		}
+	}
+
+	/**
+	 * Phase 2: scans the entire vault, builds a content-addressed object
+	 * store (objects/<sha256>.enc) plus an encrypted manifest, and pushes
+	 * everything in a single atomic commit via the Git Data API. Push-only -
+	 * no pull, no conflict handling yet (Phase 3).
+	 */
+	async pushFullVault(): Promise<void> {
+		if (!this.sessionKey) {
+			new Notice("OCSync: unlock your encryption password first");
+			return;
+		}
+		const sessionKey = this.sessionKey;
+
+		try {
+			this.setStatus("syncing");
+			const client = this.getGitHubClient();
+
+			const [scanned, remoteManifestFile] = await Promise.all([
+				scanVault(this.app, this.settings.excludePatterns),
+				client.getFile(MANIFEST_PATH),
+			]);
+
+			let remoteManifest: Manifest;
+			if (remoteManifestFile) {
+				remoteManifest = await decryptManifest(sessionKey, base64ToBytes(remoteManifestFile.contentBase64));
+			} else {
+				remoteManifest = emptyManifest();
+			}
+
+			const knownObjectHashes = new Set(Object.values(remoteManifest.files).map((f) => f.objectHash));
+
+			const newManifest: Manifest = {
+				version: remoteManifest.version,
+				files: { ...remoteManifest.files },
+			};
+			for (const file of scanned) {
+				newManifest.files[file.path] = {
+					objectHash: file.hash,
+					mtime: file.mtime,
+					size: file.size,
+					deleted: false,
+				};
+			}
+
+			const seenThisRun = new Set<string>();
+			const objectBlobs: PendingBlob[] = [];
+			for (const file of scanned) {
+				if (knownObjectHashes.has(file.hash) || seenThisRun.has(file.hash)) continue;
+				seenThisRun.add(file.hash);
+				const encrypted = await encryptBytes(sessionKey, file.data);
+				objectBlobs.push({ path: `objects/${file.hash}.enc`, contentBase64: bytesToBase64(encrypted) });
+			}
+
+			const encryptedManifest = await encryptManifest(sessionKey, newManifest);
+			const blobs: PendingBlob[] = [
+				{ path: MANIFEST_PATH, contentBase64: bytesToBase64(encryptedManifest) },
+				...objectBlobs,
+			];
+
+			await commitChanges(client, `ocsync: sync ${scanned.length} files (${objectBlobs.length} new objects)`, blobs);
+
+			this.localState.lastSyncedFiles = {};
+			for (const file of scanned) {
+				this.localState.lastSyncedFiles[file.path] = {
+					hash: file.hash,
+					mtime: file.mtime,
+					size: file.size,
+				};
+			}
+			await this.saveLocalState();
+
+			this.setStatus("ok");
+			new Notice(`OCSync: pushed ${scanned.length} files (${objectBlobs.length} new objects uploaded)`);
 		} catch (e) {
 			this.setStatus("error");
 			new Notice(`OCSync: sync failed - ${(e as Error).message}`);

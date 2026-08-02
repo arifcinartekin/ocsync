@@ -124,6 +124,114 @@ export class GitHubClient {
 		const res = await fetch(url, { headers: this.authHeaders() });
 		if (!res.ok) return this.handleErrorResponse(res, "testConnection");
 	}
+
+	// ---- Git Data API (blobs/trees/commits/refs) -------------------------
+	// Used to bundle many file changes into a single atomic commit instead
+	// of one Contents API call per file.
+
+	private repoUrl(): string {
+		return `${this.apiBase}/repos/${this.options.owner}/${this.options.repo}`;
+	}
+
+	/** Returns the commit sha the branch currently points to, or null if the branch/ref doesn't exist yet. */
+	async getBranchHeadSha(): Promise<string | null> {
+		const url = `${this.repoUrl()}/git/ref/${encodeURIComponent(`heads/${this.options.branch}`)}`;
+		const res = await fetch(url, { headers: this.authHeaders() });
+		if (res.status === 404) return null;
+		if (!res.ok) return this.handleErrorResponse(res, "getBranchHeadSha");
+		const body = (await res.json()) as { object: { sha: string } };
+		return body.object.sha;
+	}
+
+	async getCommitTreeSha(commitSha: string): Promise<string> {
+		const url = `${this.repoUrl()}/git/commits/${commitSha}`;
+		const res = await fetch(url, { headers: this.authHeaders() });
+		if (!res.ok) return this.handleErrorResponse(res, "getCommitTreeSha");
+		const body = (await res.json()) as { tree: { sha: string } };
+		return body.tree.sha;
+	}
+
+	async createBlob(contentBase64: string): Promise<string> {
+		const url = `${this.repoUrl()}/git/blobs`;
+		const res = await fetch(url, {
+			method: "POST",
+			headers: { ...this.authHeaders(), "Content-Type": "application/json" },
+			body: JSON.stringify({ content: contentBase64, encoding: "base64" }),
+		});
+		if (!res.ok) return this.handleErrorResponse(res, "createBlob");
+		const body = (await res.json()) as { sha: string };
+		return body.sha;
+	}
+
+	/**
+	 * Creates a new tree. When `baseTreeSha` is provided, only the given
+	 * entries are added/changed/removed (sha: null removes a path) - every
+	 * other path from the base tree is carried over unchanged.
+	 */
+	async createTree(baseTreeSha: string | null, entries: GitTreeEntry[]): Promise<string> {
+		const url = `${this.repoUrl()}/git/trees`;
+		const res = await fetch(url, {
+			method: "POST",
+			headers: { ...this.authHeaders(), "Content-Type": "application/json" },
+			body: JSON.stringify({
+				...(baseTreeSha ? { base_tree: baseTreeSha } : {}),
+				tree: entries,
+			}),
+		});
+		if (!res.ok) return this.handleErrorResponse(res, "createTree");
+		const body = (await res.json()) as { sha: string };
+		return body.sha;
+	}
+
+	async createCommit(message: string, treeSha: string, parents: string[]): Promise<string> {
+		const url = `${this.repoUrl()}/git/commits`;
+		const res = await fetch(url, {
+			method: "POST",
+			headers: { ...this.authHeaders(), "Content-Type": "application/json" },
+			body: JSON.stringify({ message, tree: treeSha, parents }),
+		});
+		if (!res.ok) return this.handleErrorResponse(res, "createCommit");
+		const body = (await res.json()) as { sha: string };
+		return body.sha;
+	}
+
+	/** Creates the branch ref if it doesn't exist yet. */
+	async createBranchRef(commitSha: string): Promise<void> {
+		const url = `${this.repoUrl()}/git/refs`;
+		const res = await fetch(url, {
+			method: "POST",
+			headers: { ...this.authHeaders(), "Content-Type": "application/json" },
+			body: JSON.stringify({ ref: `refs/heads/${this.options.branch}`, sha: commitSha }),
+		});
+		if (!res.ok) return this.handleErrorResponse(res, "createBranchRef");
+	}
+
+	/**
+	 * Fast-forwards (or force-updates) the branch ref. Uses `force: false` by
+	 * default so a concurrent push from another device surfaces as a 409/422
+	 * conflict rather than silently overwriting it.
+	 */
+	async updateBranchRef(commitSha: string, force = false): Promise<void> {
+		const url = `${this.repoUrl()}/git/refs/${encodeURIComponent(`heads/${this.options.branch}`)}`;
+		const res = await fetch(url, {
+			method: "PATCH",
+			headers: { ...this.authHeaders(), "Content-Type": "application/json" },
+			body: JSON.stringify({ sha: commitSha, force }),
+		});
+		if (!res.ok) {
+			if (res.status === 422) {
+				throw new GitHubConflictError("Branch ref update rejected (not a fast-forward - remote moved concurrently)");
+			}
+			return this.handleErrorResponse(res, "updateBranchRef");
+		}
+	}
+}
+
+export interface GitTreeEntry {
+	path: string;
+	mode: "100644";
+	type: "blob";
+	sha: string | null;
 }
 
 function encodeGitHubPath(path: string): string {
