@@ -45,6 +45,7 @@ export default class OCSyncPlugin extends Plugin {
 	private statusBarItem: HTMLElement | null = null;
 	private status: SyncStatus = "locked";
 	private isSyncing = false;
+	private isUnlocking = false;
 	private syncIntervalId: number | null = null;
 	private rateLimitedUntil: number | null = null;
 	readonly logger = new Logger();
@@ -81,11 +82,6 @@ export default class OCSyncPlugin extends Plugin {
 			callback: () => this.pushFullVault(),
 		});
 
-		this.app.workspace.onLayoutReady(() => {
-			if (this.hasCompleteGitHubSettings()) {
-				this.promptForPassword();
-			}
-		});
 	}
 
 	onunload(): void {
@@ -162,6 +158,18 @@ export default class OCSyncPlugin extends Plugin {
 		}).open();
 	}
 
+	isUnlocked(): boolean {
+		return this.sessionKey !== null;
+	}
+
+	/** Clears the in-memory session key and stops the background sync loop. */
+	lockNow(): void {
+		this.sessionKey = null;
+		this.stopSyncLoop();
+		this.setStatus("locked");
+		this.logger.log("Locked");
+	}
+
 	/**
 	 * Fetches (or creates, on first run) the PBKDF2 salt from the repo and
 	 * derives the session key from it. PBKDF2 itself always "succeeds" even
@@ -169,8 +177,20 @@ export default class OCSyncPlugin extends Plugin {
 	 * proactively try decrypting it right here - that's the earliest point
 	 * we can give the user a clear "wrong password" error instead of letting
 	 * them find out via garbled data on the next sync.
+	 *
+	 * Guarded against concurrent calls: two unlock attempts racing each
+	 * other (e.g. an auto-triggered prompt overlapping a manual one) could
+	 * otherwise both pass the "no manifest yet" bootstrap check and leave
+	 * `sessionKey` set to whichever one finished last - silently pointing at
+	 * the wrong key for anything already pushed by the other. Returns
+	 * whether unlocking succeeded.
 	 */
-	private async unlockWithPassword(password: string): Promise<void> {
+	async unlockWithPassword(password: string): Promise<boolean> {
+		if (this.isUnlocking) {
+			new Notice("OCSync: already processing an unlock attempt");
+			return false;
+		}
+		this.isUnlocking = true;
 		try {
 			this.setStatus("syncing");
 			const client = this.getGitHubClient();
@@ -198,7 +218,7 @@ export default class OCSyncPlugin extends Plugin {
 					const message = "Wrong password - could not decrypt the existing repository data";
 					new Notice(`OCSync: ${message}`);
 					this.logger.log(message);
-					return;
+					return false;
 				}
 			}
 
@@ -207,11 +227,15 @@ export default class OCSyncPlugin extends Plugin {
 			new Notice("OCSync: unlocked");
 			this.logger.log("Unlocked");
 			this.restartSyncLoop();
+			return true;
 		} catch (e) {
 			this.setStatus("error");
 			const message = (e as Error).message;
 			new Notice(`OCSync: failed to unlock - ${message}`);
 			this.logger.log(`Failed to unlock - ${message}`);
+			return false;
+		} finally {
+			this.isUnlocking = false;
 		}
 	}
 

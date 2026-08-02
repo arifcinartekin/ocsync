@@ -116,11 +116,15 @@ export class GitHubClient {
 		return { sha: body.content.sha };
 	}
 
-	/** Verifies the token/repo/branch combination works and is reachable. */
+	/**
+	 * Verifies the token can reach the repo. Deliberately checks repo
+	 * existence, not branch existence - a brand new repository has no
+	 * commits and therefore no branches yet, and ocsync creates the branch
+	 * itself on the first push, so requiring the branch up front would
+	 * reject the most common first-time setup.
+	 */
 	async testConnection(): Promise<void> {
-		const url = `${this.apiBase}/repos/${this.options.owner}/${this.options.repo}/branches/${encodeURIComponent(
-			this.options.branch
-		)}`;
+		const url = `${this.repoUrl()}`;
 		const res = await fetch(url, { headers: this.authHeaders() });
 		if (!res.ok) return this.handleErrorResponse(res, "testConnection");
 	}

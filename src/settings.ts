@@ -142,6 +142,51 @@ export class OCSyncSettingTab extends PluginSettingTab {
 				})
 			);
 
+		containerEl.createEl("h3", { text: "Encryption" });
+
+		const unlocked = this.plugin.isUnlocked();
+		containerEl.createEl("p", {
+			text: unlocked
+				? "🔓 Unlocked for this session. The password is held in memory only and is forgotten when Obsidian closes."
+				: "🔒 Locked. Enter your vault encryption password below to enable syncing.",
+		});
+
+		let passwordValue = "";
+		if (!unlocked) {
+			new Setting(containerEl)
+				.setName("Encryption password")
+				.setDesc(
+					"Never written to disk - re-entered each session. Wrong password is detected immediately if a manifest already exists in the repository."
+				)
+				.addText((text) => {
+					text.inputEl.type = "password";
+					text.inputEl.addEventListener("keydown", (evt) => {
+						if (evt.key === "Enter") void doUnlock();
+					});
+					text.onChange((value) => (passwordValue = value));
+				})
+				.addButton((button) =>
+					button
+						.setCta()
+						.setButtonText("Unlock")
+						.onClick(() => void doUnlock())
+				);
+		} else {
+			new Setting(containerEl).addButton((button) =>
+				button.setButtonText("Lock now").onClick(() => {
+					this.plugin.lockNow();
+					this.display();
+				})
+			);
+		}
+
+		const doUnlock = async () => {
+			if (passwordValue.length === 0) return;
+			const ok = await this.plugin.unlockWithPassword(passwordValue);
+			passwordValue = "";
+			if (ok) this.display();
+		};
+
 		new Setting(containerEl)
 			.setName("Sync now")
 			.setDesc("Pushes local changes, pulls remote changes, and creates conflict copies when both sides changed.")
