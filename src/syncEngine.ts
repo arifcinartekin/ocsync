@@ -1,11 +1,12 @@
 import { App, TFile } from "obsidian";
 import { base64ToBytes, bytesToBase64, decryptBytes, encryptBytes } from "./crypto";
 import { conflictCopyPath } from "./conflict";
+import { decideAction } from "./decideAction";
 import { GitHubClient } from "./github";
 import { commitChanges, PendingBlob } from "./gitCommit";
 import { decryptManifest, encryptManifest } from "./manifest";
 import { LocalFileState, LocalSyncState, Manifest, ManifestFileEntry, emptyManifest } from "./types";
-import { ScannedFile, scanVault } from "./vaultScanner";
+import { scanVault } from "./vaultScanner";
 import { writeLocalFile } from "./vaultWrite";
 import { mapWithConcurrency } from "./concurrency";
 
@@ -29,62 +30,6 @@ export interface SyncSummary {
 	commitSha: string | null;
 	tombstonesPurged: number;
 	noChanges: boolean;
-}
-
-type Decision =
-	| { type: "none" }
-	| { type: "push" }
-	| { type: "push-tombstone" }
-	| { type: "pull" }
-	| { type: "delete-local" }
-	| { type: "conflict" }
-	| { type: "drop-cache" };
-
-/**
- * Total decision function covering edits, new files, and deletions on both
- * sides. Deliberately conservative wherever intent is ambiguous: an edit
- * always outranks a deletion (so a device that deleted a file while another
- * device kept editing it will have the edited version resurrected locally
- * rather than losing the edit), and anything else ambiguous becomes a
- * conflict copy rather than a silent overwrite.
- */
-export function decideAction(
-	local: ScannedFile | undefined,
-	remote: ManifestFileEntry | undefined,
-	known: LocalFileState | undefined
-): Decision {
-	const remoteActive = remote && !remote.deleted;
-	const remoteDeleted = remote !== undefined && remote.deleted === true;
-	const remoteHash = remoteActive ? remote!.objectHash : undefined;
-
-	if (local) {
-		if (remoteActive) {
-			if (local.hash === remoteHash) return { type: "none" };
-			if (!known) return { type: "conflict" };
-			const localChanged = local.hash !== known.hash;
-			const remoteChanged = remoteHash !== known.hash;
-			if (localChanged && !remoteChanged) return { type: "push" };
-			if (!localChanged && remoteChanged) return { type: "pull" };
-			return { type: "conflict" };
-		}
-		if (remoteDeleted) {
-			if (!known) return { type: "push" };
-			if (local.hash === known.hash) return { type: "delete-local" };
-			return { type: "push" };
-		}
-		return { type: "push" };
-	}
-
-	// No local file.
-	if (remoteActive) {
-		if (!known) return { type: "pull" };
-		const remoteChanged = remoteHash !== known.hash;
-		if (remoteChanged) return { type: "pull" };
-		return { type: "push-tombstone" };
-	}
-	if (remoteDeleted) return { type: "drop-cache" };
-	if (known) return { type: "drop-cache" };
-	return { type: "none" };
 }
 
 interface PushAction {

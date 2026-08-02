@@ -153,5 +153,27 @@ export class OCSyncSettingTab extends PluginSettingTab {
 						await this.plugin.syncNow();
 					})
 			);
+
+		containerEl.createEl("h3", { text: "Log" });
+
+		const logEl = containerEl.createEl("textarea", { cls: "ocsync-log" });
+		logEl.readOnly = true;
+		logEl.rows = 10;
+		logEl.style.width = "100%";
+		logEl.style.fontFamily = "var(--font-monospace)";
+		logEl.value = this.plugin.logger.getText();
+
+		new Setting(containerEl)
+			.addButton((button) =>
+				button.setButtonText("Refresh").onClick(() => {
+					logEl.value = this.plugin.logger.getText();
+				})
+			)
+			.addButton((button) =>
+				button.setButtonText("Clear log").onClick(() => {
+					this.plugin.logger.clear();
+					logEl.value = this.plugin.logger.getText();
+				})
+			);
 	}
 }

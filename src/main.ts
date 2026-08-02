@@ -1,13 +1,14 @@
 import { Notice, Plugin, TFile } from "obsidian";
 import { DEFAULT_SETTINGS, OCSyncSettings, OCSyncSettingTab } from "./settings";
 import { PasswordModal } from "./passwordModal";
-import { GitHubClient } from "./github";
+import { GitHubClient, GitHubConflictError, GitHubRateLimitError } from "./github";
 import { base64ToBytes, bytesToBase64, deriveKey, encryptBytes, generateSalt } from "./crypto";
 import { decryptManifest, encryptManifest } from "./manifest";
 import { commitChanges, PendingBlob } from "./gitCommit";
 import { scanVault } from "./vaultScanner";
 import { DEFAULT_LOCAL_STATE, emptyManifest, LocalSyncState, Manifest } from "./types";
 import { runSync } from "./syncEngine";
+import { Logger } from "./logger";
 
 const SALT_PATH = "salt.txt";
 const MANIFEST_PATH = "manifest.enc";
@@ -45,6 +46,8 @@ export default class OCSyncPlugin extends Plugin {
 	private status: SyncStatus = "locked";
 	private isSyncing = false;
 	private syncIntervalId: number | null = null;
+	private rateLimitedUntil: number | null = null;
+	readonly logger = new Logger();
 
 	async onload(): Promise<void> {
 		await this.loadSettings();
@@ -161,9 +164,11 @@ export default class OCSyncPlugin extends Plugin {
 
 	/**
 	 * Fetches (or creates, on first run) the PBKDF2 salt from the repo and
-	 * derives the session key from it. A wrong password will not fail here -
-	 * PBKDF2 always succeeds - it only surfaces later as a failed AES-GCM
-	 * authentication when we try to decrypt something.
+	 * derives the session key from it. PBKDF2 itself always "succeeds" even
+	 * with a wrong password, so if a manifest already exists remotely we
+	 * proactively try decrypting it right here - that's the earliest point
+	 * we can give the user a clear "wrong password" error instead of letting
+	 * them find out via garbled data on the next sync.
 	 */
 	private async unlockWithPassword(password: string): Promise<void> {
 		try {
@@ -171,9 +176,9 @@ export default class OCSyncPlugin extends Plugin {
 			const client = this.getGitHubClient();
 
 			let saltBytes: Uint8Array;
-			const existing = await client.getFile(SALT_PATH);
-			if (existing) {
-				const saltBase64Text = contentBase64ToText(existing.contentBase64);
+			const existingSalt = await client.getFile(SALT_PATH);
+			if (existingSalt) {
+				const saltBase64Text = contentBase64ToText(existingSalt.contentBase64);
 				saltBytes = base64ToBytes(saltBase64Text);
 			} else {
 				saltBytes = generateSalt();
@@ -182,13 +187,31 @@ export default class OCSyncPlugin extends Plugin {
 				new Notice("OCSync: initialized new encryption salt in repository");
 			}
 
-			this.sessionKey = await deriveKey(password, saltBytes);
+			const candidateKey = await deriveKey(password, saltBytes);
+
+			const existingManifest = await client.getFile(MANIFEST_PATH);
+			if (existingManifest) {
+				try {
+					await decryptManifest(candidateKey, base64ToBytes(existingManifest.contentBase64));
+				} catch {
+					this.setStatus("locked");
+					const message = "Wrong password - could not decrypt the existing repository data";
+					new Notice(`OCSync: ${message}`);
+					this.logger.log(message);
+					return;
+				}
+			}
+
+			this.sessionKey = candidateKey;
 			this.setStatus("idle");
 			new Notice("OCSync: unlocked");
+			this.logger.log("Unlocked");
 			this.restartSyncLoop();
 		} catch (e) {
 			this.setStatus("error");
-			new Notice(`OCSync: failed to unlock - ${(e as Error).message}`);
+			const message = (e as Error).message;
+			new Notice(`OCSync: failed to unlock - ${message}`);
+			this.logger.log(`Failed to unlock - ${message}`);
 		}
 	}
 
@@ -251,27 +274,35 @@ export default class OCSyncPlugin extends Plugin {
 			if (!auto) new Notice("OCSync: a sync is already in progress");
 			return;
 		}
+		if (this.rateLimitedUntil && Date.now() < this.rateLimitedUntil) {
+			const waitSec = Math.ceil((this.rateLimitedUntil - Date.now()) / 1000);
+			if (!auto) new Notice(`OCSync: still rate-limited by GitHub, retrying automatically in ~${waitSec}s`);
+			return;
+		}
 		const sessionKey = this.sessionKey;
 
 		this.isSyncing = true;
+		this.logger.log(auto ? "Automatic sync starting" : "Manual sync starting");
 		try {
 			this.setStatus("syncing");
 			const client = this.getGitHubClient();
 
 			const summary = await runSync(this.app, client, sessionKey, this.settings.excludePatterns, this.localState);
 			await this.saveLocalState();
+			this.rateLimitedUntil = null;
 
 			if (summary.pullErrors.length > 0) {
 				this.setStatus("error");
-				new Notice(
-					`OCSync: sync finished with ${summary.pullErrors.length} error(s) - see first: ${summary.pullErrors[0].path}: ${summary.pullErrors[0].message}`
-				);
+				const notice = `sync finished with ${summary.pullErrors.length} error(s) - first: ${summary.pullErrors[0].path}: ${summary.pullErrors[0].message}`;
+				new Notice(`OCSync: ${notice}`);
+				this.logger.log(notice);
 			} else {
 				this.setStatus("ok");
 			}
 
 			if (summary.noChanges && summary.pullErrors.length === 0) {
 				if (!auto) new Notice("OCSync: already up to date");
+				this.logger.log("Sync complete - already up to date");
 			} else {
 				const parts: string[] = [];
 				if (summary.pushedPaths.length) parts.push(`${summary.pushedPaths.length} pushed`);
@@ -279,14 +310,32 @@ export default class OCSyncPlugin extends Plugin {
 				if (summary.deletedLocalPaths.length) parts.push(`${summary.deletedLocalPaths.length} deleted locally`);
 				if (summary.conflicts.length) parts.push(`${summary.conflicts.length} conflict(s)`);
 				if (summary.tombstonesPurged) parts.push(`${summary.tombstonesPurged} tombstone(s) purged`);
-				if (parts.length > 0) new Notice(`OCSync: ${parts.join(", ")}`);
+				if (parts.length > 0) {
+					new Notice(`OCSync: ${parts.join(", ")}`);
+					this.logger.log(`Sync complete - ${parts.join(", ")}`);
+				}
 				for (const c of summary.conflicts) {
 					new Notice(`OCSync: conflict on "${c.path}" - remote version saved as "${c.conflictPath}"`);
+					this.logger.log(`Conflict: "${c.path}" -> remote version saved as "${c.conflictPath}"`);
 				}
 			}
 		} catch (e) {
 			this.setStatus("error");
-			new Notice(`OCSync: sync failed - ${(e as Error).message}`);
+			if (e instanceof GitHubRateLimitError) {
+				this.rateLimitedUntil = Date.now() + (e.retryAfterMs ?? 60_000);
+				const waitSec = Math.ceil((e.retryAfterMs ?? 60_000) / 1000);
+				const message = `GitHub rate limit hit, will retry automatically in ~${waitSec}s`;
+				new Notice(`OCSync: ${message}`);
+				this.logger.log(message);
+			} else if (e instanceof GitHubConflictError) {
+				const message = "remote changed concurrently, will retry next sync cycle";
+				new Notice(`OCSync: ${message}`);
+				this.logger.log(message);
+			} else {
+				const message = (e as Error).message;
+				new Notice(`OCSync: sync failed - ${message}`);
+				this.logger.log(`Sync failed - ${message}`);
+			}
 		} finally {
 			this.isSyncing = false;
 		}
@@ -381,6 +430,14 @@ export default class OCSyncPlugin extends Plugin {
 			ok: "✅",
 			error: "❌",
 		};
+		const tooltips: Record<SyncStatus, string> = {
+			locked: "OCSync: locked - run \"Unlock encryption password\"",
+			idle: "OCSync: unlocked, waiting for next sync",
+			syncing: "OCSync: syncing...",
+			ok: "OCSync: last sync succeeded",
+			error: "OCSync: last sync had an error - see the log in settings",
+		};
 		this.statusBarItem.setText(`${icons[this.status]} OCSync`);
+		this.statusBarItem.setAttribute("aria-label", tooltips[this.status]);
 	}
 }

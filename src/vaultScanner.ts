@@ -1,14 +1,7 @@
 import { App, TFile } from "obsidian";
 import { sha256Hex } from "./crypto";
 import { isExcluded } from "./pathMatch";
-
-export interface ScannedFile {
-	path: string;
-	mtime: number;
-	size: number;
-	hash: string;
-	data: ArrayBuffer;
-}
+import { ScannedFile } from "./types";
 
 /**
  * Reads and hashes every non-excluded file in the vault. Note this reads

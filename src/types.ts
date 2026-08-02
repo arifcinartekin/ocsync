@@ -30,3 +30,12 @@ export interface LocalSyncState {
 export const DEFAULT_LOCAL_STATE: LocalSyncState = {
 	lastSyncedFiles: {},
 };
+
+/** A vault file as read off disk during a scan, before any encryption. */
+export interface ScannedFile {
+	path: string;
+	mtime: number;
+	size: number;
+	hash: string;
+	data: ArrayBuffer;
+}
