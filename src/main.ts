@@ -7,6 +7,7 @@ import { decryptManifest, encryptManifest } from "./manifest";
 import { commitChanges, PendingBlob } from "./gitCommit";
 import { scanVault } from "./vaultScanner";
 import { DEFAULT_LOCAL_STATE, emptyManifest, LocalSyncState, Manifest } from "./types";
+import { runSync } from "./syncEngine";
 
 const SALT_PATH = "salt.txt";
 const MANIFEST_PATH = "manifest.enc";
@@ -64,8 +65,14 @@ export default class OCSyncPlugin extends Plugin {
 		});
 
 		this.addCommand({
+			id: "ocsync-sync-now",
+			name: "Sync now",
+			callback: () => this.syncNow(),
+		});
+
+		this.addCommand({
 			id: "ocsync-push-vault",
-			name: "Sync now (push entire vault)",
+			name: "Debug: push-only full vault sync (no pull)",
 			callback: () => this.pushFullVault(),
 		});
 
@@ -205,10 +212,58 @@ export default class OCSyncPlugin extends Plugin {
 	}
 
 	/**
+	 * Phase 3: bidirectional sync. Pushes local changes, pulls remote
+	 * changes, and writes " (conflict ...)" copies instead of silently
+	 * overwriting when both sides changed the same file. This is the
+	 * command the settings "Sync now" button and (from Phase 4) the
+	 * periodic timer both call.
+	 */
+	async syncNow(): Promise<void> {
+		if (!this.sessionKey) {
+			new Notice("OCSync: unlock your encryption password first");
+			return;
+		}
+		const sessionKey = this.sessionKey;
+
+		try {
+			this.setStatus("syncing");
+			const client = this.getGitHubClient();
+
+			const summary = await runSync(this.app, client, sessionKey, this.settings.excludePatterns, this.localState);
+			await this.saveLocalState();
+
+			if (summary.pullErrors.length > 0) {
+				this.setStatus("error");
+				new Notice(
+					`OCSync: sync finished with ${summary.pullErrors.length} error(s) - see first: ${summary.pullErrors[0].path}: ${summary.pullErrors[0].message}`
+				);
+			} else {
+				this.setStatus("ok");
+			}
+
+			if (summary.noChanges && summary.pullErrors.length === 0) {
+				new Notice("OCSync: already up to date");
+			} else {
+				const parts: string[] = [];
+				if (summary.pushedPaths.length) parts.push(`${summary.pushedPaths.length} pushed`);
+				if (summary.pulledPaths.length) parts.push(`${summary.pulledPaths.length} pulled`);
+				if (summary.conflicts.length) parts.push(`${summary.conflicts.length} conflict(s)`);
+				new Notice(`OCSync: ${parts.join(", ")}`);
+				for (const c of summary.conflicts) {
+					new Notice(`OCSync: conflict on "${c.path}" - remote version saved as "${c.conflictPath}"`);
+				}
+			}
+		} catch (e) {
+			this.setStatus("error");
+			new Notice(`OCSync: sync failed - ${(e as Error).message}`);
+		}
+	}
+
+	/**
 	 * Phase 2: scans the entire vault, builds a content-addressed object
 	 * store (objects/<sha256>.enc) plus an encrypted manifest, and pushes
 	 * everything in a single atomic commit via the Git Data API. Push-only -
-	 * no pull, no conflict handling yet (Phase 3).
+	 * kept as a debug command; superseded by the bidirectional syncNow().
 	 */
 	async pushFullVault(): Promise<void> {
 		if (!this.sessionKey) {

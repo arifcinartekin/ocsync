@@ -144,13 +144,13 @@ export class OCSyncSettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName("Sync now")
-			.setDesc("Encrypts and pushes the entire vault to GitHub in a single commit.")
+			.setDesc("Pushes local changes, pulls remote changes, and creates conflict copies when both sides changed.")
 			.addButton((button) =>
 				button
 					.setCta()
 					.setButtonText("Sync now")
 					.onClick(async () => {
-						await this.plugin.pushFullVault();
+						await this.plugin.syncNow();
 					})
 			);
 	}
