@@ -1,0 +1,9 @@
+{
+	"id": "ocsync",
+	"name": "OCSync",
+	"version": "0.1.0",
+	"minAppVersion": "1.4.0",
+	"description": "End-to-end encrypted, GitHub-based bidirectional sync for your vault. Personal use only.",
+	"author": "arifcinartekin",
+	"isDesktopOnly": false
+}
