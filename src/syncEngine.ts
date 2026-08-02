@@ -1,4 +1,4 @@
-import { App } from "obsidian";
+import { App, TFile } from "obsidian";
 import { base64ToBytes, bytesToBase64, decryptBytes, encryptBytes } from "./crypto";
 import { conflictCopyPath } from "./conflict";
 import { GitHubClient } from "./github";
@@ -12,7 +12,8 @@ import { mapWithConcurrency } from "./concurrency";
 const MANIFEST_PATH = "manifest.enc";
 const DOWNLOAD_CONCURRENCY = 6;
 
-export type SyncActionType = "push" | "pull" | "conflict" | "none";
+/** How long a deletion tombstone stays in the manifest before being purged. */
+export const TOMBSTONE_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 
 export interface ConflictEvent {
 	path: string;
@@ -22,49 +23,77 @@ export interface ConflictEvent {
 export interface SyncSummary {
 	pushedPaths: string[];
 	pulledPaths: string[];
+	deletedLocalPaths: string[];
 	conflicts: ConflictEvent[];
 	pullErrors: { path: string; message: string }[];
 	commitSha: string | null;
+	tombstonesPurged: number;
 	noChanges: boolean;
 }
 
+type Decision =
+	| { type: "none" }
+	| { type: "push" }
+	| { type: "push-tombstone" }
+	| { type: "pull" }
+	| { type: "delete-local" }
+	| { type: "conflict" }
+	| { type: "drop-cache" };
+
 /**
- * Three-way decision per path: compares the current local file against what
- * we last knew was in sync, and against the current remote manifest entry.
- * Deliberately conservative - anything ambiguous becomes a conflict rather
- * than risking silent data loss.
+ * Total decision function covering edits, new files, and deletions on both
+ * sides. Deliberately conservative wherever intent is ambiguous: an edit
+ * always outranks a deletion (so a device that deleted a file while another
+ * device kept editing it will have the edited version resurrected locally
+ * rather than losing the edit), and anything else ambiguous becomes a
+ * conflict copy rather than a silent overwrite.
  */
 export function decideAction(
 	local: ScannedFile | undefined,
 	remote: ManifestFileEntry | undefined,
 	known: LocalFileState | undefined
-): SyncActionType | "local-deleted" {
-	const remoteHash = remote && !remote.deleted ? remote.objectHash : undefined;
+): Decision {
+	const remoteActive = remote && !remote.deleted;
+	const remoteDeleted = remote !== undefined && remote.deleted === true;
+	const remoteHash = remoteActive ? remote!.objectHash : undefined;
 
-	if (!local) {
-		// Local deletion propagation is handled in Phase 4 (tombstones). For
-		// now: a path with no local file and no prior known state is simply
-		// something that only exists remotely -> pull it down.
-		if (!known) return remoteHash ? "pull" : "none";
-		return "local-deleted";
+	if (local) {
+		if (remoteActive) {
+			if (local.hash === remoteHash) return { type: "none" };
+			if (!known) return { type: "conflict" };
+			const localChanged = local.hash !== known.hash;
+			const remoteChanged = remoteHash !== known.hash;
+			if (localChanged && !remoteChanged) return { type: "push" };
+			if (!localChanged && remoteChanged) return { type: "pull" };
+			return { type: "conflict" };
+		}
+		if (remoteDeleted) {
+			if (!known) return { type: "push" };
+			if (local.hash === known.hash) return { type: "delete-local" };
+			return { type: "push" };
+		}
+		return { type: "push" };
 	}
 
-	if (!remoteHash) {
-		// Never pushed before, or the remote entry disappeared - keep the
-		// local copy safe by pushing it.
-		return "push";
+	// No local file.
+	if (remoteActive) {
+		if (!known) return { type: "pull" };
+		const remoteChanged = remoteHash !== known.hash;
+		if (remoteChanged) return { type: "pull" };
+		return { type: "push-tombstone" };
 	}
+	if (remoteDeleted) return { type: "drop-cache" };
+	if (known) return { type: "drop-cache" };
+	return { type: "none" };
+}
 
-	if (local.hash === remoteHash) return "none";
-
-	if (!known) return "conflict";
-
-	const localChanged = local.hash !== known.hash;
-	const remoteChanged = remoteHash !== known.hash;
-
-	if (localChanged && !remoteChanged) return "push";
-	if (!localChanged && remoteChanged) return "pull";
-	return "conflict";
+interface PushAction {
+	path: string;
+	objectHash: string;
+	mtime: number;
+	size: number;
+	deleted: boolean;
+	uploadData: ArrayBuffer | null;
 }
 
 export async function runSync(
@@ -90,34 +119,24 @@ export async function runSync(
 		...Object.keys(localState.lastSyncedFiles),
 	]);
 
-	interface PushAction {
-		path: string;
-		objectHash: string;
-		mtime: number;
-		size: number;
-		uploadData: ArrayBuffer | null;
-	}
 	const pushActions: PushAction[] = [];
 	const pullPaths: string[] = [];
+	const deleteLocalPaths: string[] = [];
+	const dropCachePaths: string[] = [];
 	const conflicts: ConflictEvent[] = [];
 	const pullErrors: { path: string; message: string }[] = [];
 	const converged = new Map<string, LocalFileState>();
-	const droppedFromCache: string[] = [];
 
 	for (const path of allPaths) {
 		const local = scannedByPath.get(path);
 		const remote = remoteManifest.files[path];
 		const known = localState.lastSyncedFiles[path];
 
-		const action = decideAction(local, remote, known);
+		const decision = decideAction(local, remote, known);
 
-		switch (action) {
+		switch (decision.type) {
 			case "none":
 				if (local) converged.set(path, { hash: local.hash, mtime: local.mtime, size: local.size });
-				break;
-			case "local-deleted":
-				// Deletion propagation lands in Phase 4. Leave the cached state
-				// untouched so this stays consistent until then.
 				break;
 			case "push":
 				if (local) {
@@ -126,36 +145,41 @@ export async function runSync(
 						objectHash: local.hash,
 						mtime: local.mtime,
 						size: local.size,
+						deleted: false,
 						uploadData: local.data,
 					});
 				}
 				break;
+			case "push-tombstone":
+				pushActions.push({
+					path,
+					objectHash: known?.hash ?? "",
+					mtime: Date.now(),
+					size: 0,
+					deleted: true,
+					uploadData: null,
+				});
+				break;
 			case "pull":
 				pullPaths.push(path);
 				break;
-			case "conflict":
-				if (local && remote) {
-					conflicts.push({ path, conflictPath: conflictCopyPath(path) });
-				}
+			case "delete-local":
+				deleteLocalPaths.push(path);
 				break;
-		}
-
-		if (!local && !remote && known) {
-			droppedFromCache.push(path);
+			case "drop-cache":
+				dropCachePaths.push(path);
+				break;
+			case "conflict":
+				if (local && remote) conflicts.push({ path, conflictPath: conflictCopyPath(path) });
+				break;
 		}
 	}
 
 	// Resolve pulls (including the "remote wins" half of each conflict) by
 	// downloading and decrypting the remote object, then writing it locally.
-	const objectsNeeded = new Map<string, string>(); // objectHash -> a path that needs it (for error messages)
-	for (const path of pullPaths) {
-		const hash = remoteManifest.files[path].objectHash;
-		objectsNeeded.set(hash, path);
-	}
-	for (const c of conflicts) {
-		const hash = remoteManifest.files[c.path].objectHash;
-		objectsNeeded.set(hash, c.conflictPath);
-	}
+	const objectsNeeded = new Map<string, string>(); // objectHash -> a path referencing it (for error attribution)
+	for (const path of pullPaths) objectsNeeded.set(remoteManifest.files[path].objectHash, path);
+	for (const c of conflicts) objectsNeeded.set(remoteManifest.files[c.path].objectHash, c.conflictPath);
 
 	const downloadedObjects = new Map<string, ArrayBuffer>();
 	await mapWithConcurrency(Array.from(objectsNeeded.entries()), DOWNLOAD_CONCURRENCY, async ([hash, contextPath]) => {
@@ -174,7 +198,7 @@ export async function runSync(
 	for (const path of pullPaths) {
 		const hash = remoteManifest.files[path].objectHash;
 		const data = downloadedObjects.get(hash);
-		if (!data) continue; // already recorded in pullErrors
+		if (!data) continue;
 		try {
 			await writeLocalFile(app, path, data);
 			pulledPaths.push(path);
@@ -188,33 +212,42 @@ export async function runSync(
 	for (const c of conflicts) {
 		const remoteEntry = remoteManifest.files[c.path];
 		const data = downloadedObjects.get(remoteEntry.objectHash);
-		if (!data) continue; // already recorded in pullErrors
+		if (!data) continue;
 		try {
 			await writeLocalFile(app, c.conflictPath, data);
 			resolvedConflicts.push(c);
 
-			// The remote version now lives at conflictPath - reference the
-			// already-uploaded object, no new blob upload needed.
 			pushActions.push({
 				path: c.conflictPath,
 				objectHash: remoteEntry.objectHash,
 				mtime: Date.now(),
 				size: data.byteLength,
+				deleted: false,
 				uploadData: null,
 			});
 			converged.set(c.conflictPath, { hash: remoteEntry.objectHash, mtime: Date.now(), size: data.byteLength });
 
-			// The local version keeps its own path and gets pushed as-is.
 			const local = scannedByPath.get(c.path);
-			if (local) {
-				converged.set(c.path, { hash: local.hash, mtime: local.mtime, size: local.size });
-			}
+			if (local) converged.set(c.path, { hash: local.hash, mtime: local.mtime, size: local.size });
 		} catch (e) {
 			pullErrors.push({ path: c.conflictPath, message: (e as Error).message });
 		}
 	}
 
-	// Stage new objects and build the updated manifest for anything being pushed.
+	// Apply confirmed remote deletions locally (only reached when the local
+	// copy was unchanged since the last sync - see decideAction).
+	const deletedLocalPaths: string[] = [];
+	for (const path of deleteLocalPaths) {
+		const file = app.vault.getAbstractFileByPath(path);
+		try {
+			if (file instanceof TFile) await app.vault.trash(file, false);
+			deletedLocalPaths.push(path);
+		} catch (e) {
+			pullErrors.push({ path, message: (e as Error).message });
+		}
+	}
+
+	// Stage new objects for anything being pushed.
 	const seenThisRun = new Set<string>();
 	const objectBlobs: PendingBlob[] = [];
 	for (const action of pushActions) {
@@ -225,19 +258,30 @@ export async function runSync(
 		objectBlobs.push({ path: `objects/${action.objectHash}.enc`, contentBase64: bytesToBase64(encrypted) });
 	}
 
-	let commitSha: string | null = null;
-	if (pushActions.length > 0) {
-		const newManifest: Manifest = { version: remoteManifest.version, files: { ...remoteManifest.files } };
-		for (const action of pushActions) {
-			newManifest.files[action.path] = {
-				objectHash: action.objectHash,
-				mtime: action.mtime,
-				size: action.size,
-				deleted: false,
-			};
-			converged.set(action.path, { hash: action.objectHash, mtime: action.mtime, size: action.size });
-		}
+	const newManifestFiles: Record<string, ManifestFileEntry> = { ...remoteManifest.files };
+	for (const action of pushActions) {
+		newManifestFiles[action.path] = {
+			objectHash: action.objectHash,
+			mtime: action.mtime,
+			size: action.size,
+			deleted: action.deleted,
+		};
+		converged.set(action.path, { hash: action.objectHash, mtime: action.mtime, size: action.size });
+	}
 
+	let tombstonesPurged = 0;
+	for (const [path, entry] of Object.entries(newManifestFiles)) {
+		if (entry.deleted && Date.now() - entry.mtime > TOMBSTONE_RETENTION_MS) {
+			delete newManifestFiles[path];
+			tombstonesPurged++;
+		}
+	}
+
+	const manifestChanged = pushActions.length > 0 || tombstonesPurged > 0;
+
+	let commitSha: string | null = null;
+	if (manifestChanged) {
+		const newManifest: Manifest = { version: remoteManifest.version, files: newManifestFiles };
 		const encryptedManifest = await encryptManifest(sessionKey, newManifest);
 		const blobs: PendingBlob[] = [
 			{ path: MANIFEST_PATH, contentBase64: bytesToBase64(encryptedManifest) },
@@ -245,25 +289,31 @@ export async function runSync(
 		];
 		commitSha = await commitChanges(
 			client,
-			`ocsync: sync (${pushActions.length} changed, ${pulledPaths.length} pulled, ${resolvedConflicts.length} conflicts)`,
+			`ocsync: sync (${pushActions.length} changed, ${pulledPaths.length} pulled, ` +
+				`${resolvedConflicts.length} conflicts, ${tombstonesPurged} tombstones purged)`,
 			blobs
 		);
 	}
 
-	// Update the local "last known synced" cache to the converged state.
 	for (const [path, state] of converged) {
 		localState.lastSyncedFiles[path] = state;
 	}
-	for (const path of droppedFromCache) {
+	for (const path of [...dropCachePaths, ...deletedLocalPaths]) {
 		delete localState.lastSyncedFiles[path];
 	}
 
 	return {
 		pushedPaths: pushActions.map((a) => a.path),
 		pulledPaths,
+		deletedLocalPaths,
 		conflicts: resolvedConflicts,
 		pullErrors,
 		commitSha,
-		noChanges: pushActions.length === 0 && pulledPaths.length === 0 && resolvedConflicts.length === 0,
+		tombstonesPurged,
+		noChanges:
+			pushActions.length === 0 &&
+			pulledPaths.length === 0 &&
+			resolvedConflicts.length === 0 &&
+			deletedLocalPaths.length === 0,
 	};
 }

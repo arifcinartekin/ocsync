@@ -43,6 +43,8 @@ export default class OCSyncPlugin extends Plugin {
 
 	private statusBarItem: HTMLElement | null = null;
 	private status: SyncStatus = "locked";
+	private isSyncing = false;
+	private syncIntervalId: number | null = null;
 
 	async onload(): Promise<void> {
 		await this.loadSettings();
@@ -85,6 +87,7 @@ export default class OCSyncPlugin extends Plugin {
 
 	onunload(): void {
 		this.sessionKey = null;
+		this.stopSyncLoop();
 	}
 
 	async loadSettings(): Promise<void> {
@@ -106,9 +109,27 @@ export default class OCSyncPlugin extends Plugin {
 		await this.saveData(data);
 	}
 
-	/** Placeholder until Phase 4 introduces the real periodic sync loop. */
+	/**
+	 * (Re)starts the background timer that calls syncNow() automatically.
+	 * Only runs once the vault is unlocked; safe to call repeatedly (e.g. on
+	 * every settings change) since it always clears any previous timer first.
+	 */
 	restartSyncLoop(): void {
-		// No-op in Phase 1.
+		this.stopSyncLoop();
+		if (!this.sessionKey || !this.hasCompleteGitHubSettings()) return;
+
+		const intervalMs = Math.max(1, this.settings.syncIntervalSeconds) * 1000;
+		this.syncIntervalId = window.setInterval(() => {
+			void this.syncNow(true);
+		}, intervalMs);
+		this.registerInterval(this.syncIntervalId);
+	}
+
+	private stopSyncLoop(): void {
+		if (this.syncIntervalId !== null) {
+			window.clearInterval(this.syncIntervalId);
+			this.syncIntervalId = null;
+		}
 	}
 
 	hasCompleteGitHubSettings(): boolean {
@@ -164,6 +185,7 @@ export default class OCSyncPlugin extends Plugin {
 			this.sessionKey = await deriveKey(password, saltBytes);
 			this.setStatus("idle");
 			new Notice("OCSync: unlocked");
+			this.restartSyncLoop();
 		} catch (e) {
 			this.setStatus("error");
 			new Notice(`OCSync: failed to unlock - ${(e as Error).message}`);
@@ -212,19 +234,26 @@ export default class OCSyncPlugin extends Plugin {
 	}
 
 	/**
-	 * Phase 3: bidirectional sync. Pushes local changes, pulls remote
-	 * changes, and writes " (conflict ...)" copies instead of silently
-	 * overwriting when both sides changed the same file. This is the
-	 * command the settings "Sync now" button and (from Phase 4) the
-	 * periodic timer both call.
+	 * Bidirectional sync: pushes local changes, pulls remote changes,
+	 * propagates deletions via tombstones, and writes " (conflict ...)"
+	 * copies instead of silently overwriting when both sides changed the
+	 * same file. Called by the settings "Sync now" button, the command
+	 * palette, and the automatic background timer (`auto: true`, which
+	 * suppresses the "already up to date" notice to avoid spamming the user
+	 * every sync interval).
 	 */
-	async syncNow(): Promise<void> {
+	async syncNow(auto = false): Promise<void> {
 		if (!this.sessionKey) {
-			new Notice("OCSync: unlock your encryption password first");
+			if (!auto) new Notice("OCSync: unlock your encryption password first");
+			return;
+		}
+		if (this.isSyncing) {
+			if (!auto) new Notice("OCSync: a sync is already in progress");
 			return;
 		}
 		const sessionKey = this.sessionKey;
 
+		this.isSyncing = true;
 		try {
 			this.setStatus("syncing");
 			const client = this.getGitHubClient();
@@ -242,13 +271,15 @@ export default class OCSyncPlugin extends Plugin {
 			}
 
 			if (summary.noChanges && summary.pullErrors.length === 0) {
-				new Notice("OCSync: already up to date");
+				if (!auto) new Notice("OCSync: already up to date");
 			} else {
 				const parts: string[] = [];
 				if (summary.pushedPaths.length) parts.push(`${summary.pushedPaths.length} pushed`);
 				if (summary.pulledPaths.length) parts.push(`${summary.pulledPaths.length} pulled`);
+				if (summary.deletedLocalPaths.length) parts.push(`${summary.deletedLocalPaths.length} deleted locally`);
 				if (summary.conflicts.length) parts.push(`${summary.conflicts.length} conflict(s)`);
-				new Notice(`OCSync: ${parts.join(", ")}`);
+				if (summary.tombstonesPurged) parts.push(`${summary.tombstonesPurged} tombstone(s) purged`);
+				if (parts.length > 0) new Notice(`OCSync: ${parts.join(", ")}`);
 				for (const c of summary.conflicts) {
 					new Notice(`OCSync: conflict on "${c.path}" - remote version saved as "${c.conflictPath}"`);
 				}
@@ -256,6 +287,8 @@ export default class OCSyncPlugin extends Plugin {
 		} catch (e) {
 			this.setStatus("error");
 			new Notice(`OCSync: sync failed - ${(e as Error).message}`);
+		} finally {
+			this.isSyncing = false;
 		}
 	}
 
