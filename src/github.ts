@@ -3,9 +3,14 @@
  * no external git binary - this must work unmodified on iOS/Android where
  * there is no shell access.
  *
- * Phase 1 only needs the Contents API (get/put a single file). The Git Data
- * API (blobs/trees/commits/refs, for atomic multi-file commits) is added in
- * Phase 2.
+ * Reads deliberately go through the Git Data API (blobs/trees/commits/refs)
+ * rather than the higher-level Contents API. In testing, the Contents API
+ * repeatedly served stale data for well over a minute after a commit made
+ * via the Git Data API - the two are backed by different caching layers.
+ * Writes to manifest.enc/objects/* already went through the Git Data API;
+ * routing reads through it too means reads and writes hit the same
+ * consistency guarantees. `putFile` (Contents API) is kept only for the
+ * one-off salt.txt bootstrap write, which isn't read-after-write sensitive.
  */
 
 export interface GitHubClientOptions {
@@ -80,17 +85,31 @@ export class GitHubClient {
 		throw new GitHubApiError(`GitHub API error during ${context}: HTTP ${res.status}`, res.status);
 	}
 
-	/** Returns null if the file does not exist (404). */
+	/**
+	 * Returns null if the file (or the branch itself) does not exist.
+	 * Walks branch -> commit -> tree -> ... -> blob entirely through the Git
+	 * Data API so this always reflects the latest commit, unlike the
+	 * Contents API - see the class-level comment.
+	 */
 	async getFile(path: string): Promise<RemoteFile | null> {
-		const url = `${this.apiBase}/repos/${this.options.owner}/${this.options.repo}/contents/${encodeGitHubPath(
-			path
-		)}?ref=${encodeURIComponent(this.options.branch)}`;
-		const res = await fetch(url, { headers: this.authHeaders() });
-		if (res.status === 404) return null;
-		if (!res.ok) return this.handleErrorResponse(res, `getFile(${path})`);
-		const body = (await res.json()) as { sha: string; content: string; encoding: string };
-		const contentBase64 = body.encoding === "base64" ? body.content.replace(/\n/g, "") : btoa(body.content);
-		return { sha: body.sha, contentBase64 };
+		const headSha = await this.getBranchHeadSha();
+		if (!headSha) return null;
+		const rootTreeSha = await this.getCommitTreeSha(headSha);
+
+		const segments = path.split("/");
+		let currentTreeSha = rootTreeSha;
+		for (let i = 0; i < segments.length - 1; i++) {
+			const entries = await this.getTreeCached(currentTreeSha);
+			const dirEntry = entries.find((e) => e.path === segments[i] && e.type === "tree");
+			if (!dirEntry) return null;
+			currentTreeSha = dirEntry.sha;
+		}
+
+		const entries = await this.getTreeCached(currentTreeSha);
+		const fileEntry = entries.find((e) => e.path === segments[segments.length - 1] && e.type === "blob");
+		if (!fileEntry) return null;
+
+		return this.getBlob(fileEntry.sha);
 	}
 
 	/**
@@ -140,7 +159,7 @@ export class GitHubClient {
 	/** Returns the commit sha the branch currently points to, or null if the branch/ref doesn't exist yet. */
 	async getBranchHeadSha(): Promise<string | null> {
 		const url = `${this.repoUrl()}/git/ref/${encodeURIComponent(`heads/${this.options.branch}`)}`;
-		const res = await fetch(url, { headers: this.authHeaders() });
+		const res = await fetch(url, { headers: this.authHeaders(), cache: "no-store" });
 		if (res.status === 404) return null;
 		if (!res.ok) return this.handleErrorResponse(res, "getBranchHeadSha");
 		const body = (await res.json()) as { object: { sha: string } };
@@ -149,10 +168,43 @@ export class GitHubClient {
 
 	async getCommitTreeSha(commitSha: string): Promise<string> {
 		const url = `${this.repoUrl()}/git/commits/${commitSha}`;
-		const res = await fetch(url, { headers: this.authHeaders() });
+		const res = await fetch(url, { headers: this.authHeaders(), cache: "no-store" });
 		if (!res.ok) return this.handleErrorResponse(res, "getCommitTreeSha");
 		const body = (await res.json()) as { tree: { sha: string } };
 		return body.tree.sha;
+	}
+
+	/**
+	 * Per-instance cache keyed by tree sha (trees are content-addressed, so
+	 * this is always safe to reuse) - avoids re-fetching the "objects"
+	 * subtree once per file when a single sync pulls/looks up many objects.
+	 */
+	private treeCache = new Map<string, GitTreeListEntry[]>();
+
+	private async getTreeCached(treeSha: string): Promise<GitTreeListEntry[]> {
+		const cached = this.treeCache.get(treeSha);
+		if (cached) return cached;
+		const entries = await this.getTree(treeSha);
+		this.treeCache.set(treeSha, entries);
+		return entries;
+	}
+
+	/** Non-recursive: lists only the immediate entries of one tree object. */
+	async getTree(treeSha: string): Promise<GitTreeListEntry[]> {
+		const url = `${this.repoUrl()}/git/trees/${treeSha}`;
+		const res = await fetch(url, { headers: this.authHeaders(), cache: "no-store" });
+		if (!res.ok) return this.handleErrorResponse(res, "getTree");
+		const body = (await res.json()) as { tree: GitTreeListEntry[] };
+		return body.tree;
+	}
+
+	async getBlob(blobSha: string): Promise<RemoteFile> {
+		const url = `${this.repoUrl()}/git/blobs/${blobSha}`;
+		const res = await fetch(url, { headers: this.authHeaders(), cache: "no-store" });
+		if (!res.ok) return this.handleErrorResponse(res, "getBlob");
+		const body = (await res.json()) as { sha: string; content: string; encoding: string };
+		const contentBase64 = body.encoding === "base64" ? body.content.replace(/\n/g, "") : btoa(body.content);
+		return { sha: body.sha, contentBase64 };
 	}
 
 	async createBlob(contentBase64: string): Promise<string> {
@@ -236,6 +288,14 @@ export interface GitTreeEntry {
 	mode: "100644";
 	type: "blob";
 	sha: string | null;
+}
+
+/** One entry as returned when *reading* a tree (not the write-side GitTreeEntry above). */
+export interface GitTreeListEntry {
+	path: string;
+	mode: string;
+	type: "blob" | "tree" | "commit";
+	sha: string;
 }
 
 function encodeGitHubPath(path: string): string {
