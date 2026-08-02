@@ -156,11 +156,18 @@ export class GitHubClient {
 		return `${this.apiBase}/repos/${this.options.owner}/${this.options.repo}`;
 	}
 
-	/** Returns the commit sha the branch currently points to, or null if the branch/ref doesn't exist yet. */
+	/**
+	 * Returns the commit sha the branch currently points to, or null if the
+	 * branch/ref doesn't exist yet. A repository with zero commits returns
+	 * 409 "Git Repository is empty" from this endpoint instead of the 404
+	 * you'd expect for a missing ref - both mean the same thing here: there
+	 * is no branch yet, so treat them identically rather than surfacing the
+	 * 409 as a real (ref-moved-concurrently) conflict.
+	 */
 	async getBranchHeadSha(): Promise<string | null> {
 		const url = `${this.repoUrl()}/git/ref/${encodeURIComponent(`heads/${this.options.branch}`)}`;
 		const res = await fetch(url, { headers: this.authHeaders(), cache: "no-store" });
-		if (res.status === 404) return null;
+		if (res.status === 404 || res.status === 409) return null;
 		if (!res.ok) return this.handleErrorResponse(res, "getBranchHeadSha");
 		const body = (await res.json()) as { object: { sha: string } };
 		return body.object.sha;
