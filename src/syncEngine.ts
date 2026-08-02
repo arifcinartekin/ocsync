@@ -13,6 +13,29 @@ import { mapWithConcurrency } from "./concurrency";
 const MANIFEST_PATH = "manifest.enc";
 const DOWNLOAD_CONCURRENCY = 6;
 
+/**
+ * GitHub's Contents API (used to read manifest.enc) can lag a few seconds
+ * behind writes made via the Git Data API (used to commit). A decrypt
+ * failure right after a push is more likely to be that staleness than an
+ * actual wrong key, so we re-fetch and retry once before giving up.
+ */
+export async function fetchAndDecryptManifest(client: GitHubClient, sessionKey: CryptoKey): Promise<Manifest> {
+	const first = await client.getFile(MANIFEST_PATH);
+	if (!first) return emptyManifest();
+	try {
+		return await decryptManifest(sessionKey, base64ToBytes(first.contentBase64));
+	} catch (firstError) {
+		await new Promise((resolve) => setTimeout(resolve, 2500));
+		const second = await client.getFile(MANIFEST_PATH);
+		if (!second) return emptyManifest();
+		try {
+			return await decryptManifest(sessionKey, base64ToBytes(second.contentBase64));
+		} catch {
+			throw firstError;
+		}
+	}
+}
+
 /** How long a deletion tombstone stays in the manifest before being purged. */
 export const TOMBSTONE_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 
@@ -51,10 +74,7 @@ export async function runSync(
 	const scanned = await scanVault(app, excludePatterns);
 	const scannedByPath = new Map(scanned.map((f) => [f.path, f]));
 
-	const remoteManifestFile = await client.getFile(MANIFEST_PATH);
-	const remoteManifest: Manifest = remoteManifestFile
-		? await decryptManifest(sessionKey, base64ToBytes(remoteManifestFile.contentBase64))
-		: emptyManifest();
+	const remoteManifest: Manifest = await fetchAndDecryptManifest(client, sessionKey);
 
 	const knownObjectHashes = new Set(Object.values(remoteManifest.files).map((f) => f.objectHash));
 

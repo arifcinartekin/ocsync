@@ -7,7 +7,7 @@ import { decryptManifest, encryptManifest } from "./manifest";
 import { commitChanges, PendingBlob } from "./gitCommit";
 import { scanVault } from "./vaultScanner";
 import { DEFAULT_LOCAL_STATE, emptyManifest, LocalSyncState, Manifest } from "./types";
-import { runSync } from "./syncEngine";
+import { fetchAndDecryptManifest, runSync } from "./syncEngine";
 import { Logger } from "./logger";
 
 const SALT_PATH = "salt.txt";
@@ -209,17 +209,14 @@ export default class OCSyncPlugin extends Plugin {
 
 			const candidateKey = await deriveKey(password, saltBytes);
 
-			const existingManifest = await client.getFile(MANIFEST_PATH);
-			if (existingManifest) {
-				try {
-					await decryptManifest(candidateKey, base64ToBytes(existingManifest.contentBase64));
-				} catch {
-					this.setStatus("locked");
-					const message = "Wrong password - could not decrypt the existing repository data";
-					new Notice(`OCSync: ${message}`);
-					this.logger.log(message);
-					return false;
-				}
+			try {
+				await fetchAndDecryptManifest(client, candidateKey);
+			} catch {
+				this.setStatus("locked");
+				const message = "Wrong password - could not decrypt the existing repository data";
+				new Notice(`OCSync: ${message}`);
+				this.logger.log(message);
+				return false;
 			}
 
 			this.sessionKey = candidateKey;
