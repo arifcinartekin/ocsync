@@ -1,5 +1,5 @@
 import { App, TFile } from "obsidian";
-import { base64ToBytes, bytesToBase64, decryptBytes, encryptBytes } from "./crypto";
+import { base64ToBytes, bytesToBase64, decryptBytes, encryptBytes, sha256Hex } from "./crypto";
 import { conflictCopyPath } from "./conflict";
 import { decideAction } from "./decideAction";
 import { GitHubClient } from "./github";
@@ -13,21 +13,35 @@ import { mapWithConcurrency } from "./concurrency";
 const MANIFEST_PATH = "manifest.enc";
 const DOWNLOAD_CONCURRENCY = 6;
 
+/** A short, non-sensitive fingerprint of ciphertext bytes for log-comparison across pushes/reads. */
+async function shortDigest(contentBase64: string): Promise<string> {
+	const bytes = base64ToBytes(contentBase64);
+	const hex = await sha256Hex(bytes.buffer as ArrayBuffer);
+	return `${bytes.length}b/${hex.slice(0, 12)}`;
+}
+
 /**
  * GitHub's Contents API (used to read manifest.enc) can lag a few seconds
  * behind writes made via the Git Data API (used to commit). A decrypt
  * failure right after a push is more likely to be that staleness than an
  * actual wrong key, so we re-fetch and retry once before giving up.
  */
-export async function fetchAndDecryptManifest(client: GitHubClient, sessionKey: CryptoKey): Promise<Manifest> {
+export async function fetchAndDecryptManifest(
+	client: GitHubClient,
+	sessionKey: CryptoKey,
+	onLog?: (msg: string) => void
+): Promise<Manifest> {
 	const first = await client.getFile(MANIFEST_PATH);
 	if (!first) return emptyManifest();
+	onLog?.(`Fetched manifest.enc (${await shortDigest(first.contentBase64)})`);
 	try {
 		return await decryptManifest(sessionKey, base64ToBytes(first.contentBase64));
 	} catch (firstError) {
+		onLog?.("Decrypt failed on first read, retrying fetch once...");
 		await new Promise((resolve) => setTimeout(resolve, 2500));
 		const second = await client.getFile(MANIFEST_PATH);
 		if (!second) return emptyManifest();
+		onLog?.(`Re-fetched manifest.enc (${await shortDigest(second.contentBase64)})`);
 		try {
 			return await decryptManifest(sessionKey, base64ToBytes(second.contentBase64));
 		} catch {
@@ -69,12 +83,13 @@ export async function runSync(
 	client: GitHubClient,
 	sessionKey: CryptoKey,
 	excludePatterns: string[],
-	localState: LocalSyncState
+	localState: LocalSyncState,
+	onLog?: (msg: string) => void
 ): Promise<SyncSummary> {
 	const scanned = await scanVault(app, excludePatterns);
 	const scannedByPath = new Map(scanned.map((f) => [f.path, f]));
 
-	const remoteManifest: Manifest = await fetchAndDecryptManifest(client, sessionKey);
+	const remoteManifest: Manifest = await fetchAndDecryptManifest(client, sessionKey, onLog);
 
 	const knownObjectHashes = new Set(Object.values(remoteManifest.files).map((f) => f.objectHash));
 
@@ -248,16 +263,16 @@ export async function runSync(
 	if (manifestChanged) {
 		const newManifest: Manifest = { version: remoteManifest.version, files: newManifestFiles };
 		const encryptedManifest = await encryptManifest(sessionKey, newManifest);
-		const blobs: PendingBlob[] = [
-			{ path: MANIFEST_PATH, contentBase64: bytesToBase64(encryptedManifest) },
-			...objectBlobs,
-		];
+		const manifestContentBase64 = bytesToBase64(encryptedManifest);
+		onLog?.(`Pushing manifest.enc (${await shortDigest(manifestContentBase64)})`);
+		const blobs: PendingBlob[] = [{ path: MANIFEST_PATH, contentBase64: manifestContentBase64 }, ...objectBlobs];
 		commitSha = await commitChanges(
 			client,
 			`ocsync: sync (${pushActions.length} changed, ${pulledPaths.length} pulled, ` +
 				`${resolvedConflicts.length} conflicts, ${tombstonesPurged} tombstones purged)`,
 			blobs
 		);
+		onLog?.(`Commit ${commitSha?.slice(0, 8)} created`);
 	}
 
 	for (const [path, state] of converged) {

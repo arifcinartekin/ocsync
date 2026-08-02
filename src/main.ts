@@ -210,7 +210,7 @@ export default class OCSyncPlugin extends Plugin {
 			const candidateKey = await deriveKey(password, saltBytes);
 
 			try {
-				await fetchAndDecryptManifest(client, candidateKey);
+				await fetchAndDecryptManifest(client, candidateKey, (msg) => this.logger.log(msg));
 			} catch {
 				this.setStatus("locked");
 				const message = "Wrong password - could not decrypt the existing repository data";
@@ -308,7 +308,14 @@ export default class OCSyncPlugin extends Plugin {
 			this.setStatus("syncing");
 			const client = this.getGitHubClient();
 
-			const summary = await runSync(this.app, client, sessionKey, this.settings.excludePatterns, this.localState);
+			const summary = await runSync(
+				this.app,
+				client,
+				sessionKey,
+				this.settings.excludePatterns,
+				this.localState,
+				(msg) => this.logger.log(msg)
+			);
 			await this.saveLocalState();
 			this.rateLimitedUntil = null;
 
